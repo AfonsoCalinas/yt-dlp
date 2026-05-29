@@ -1489,6 +1489,89 @@ class YoutubeDL:
         outtmpl, info_dict = self.prepare_outtmpl(outtmpl, info_dict, *args, **kwargs)
         return self.escape_outtmpl(outtmpl) % info_dict
 
+    def _extract_trimmable_fields(self, outtmpl):
+        marker_prefix = ''.join(random.choices(string.ascii_letters, k=32))
+        non_trimmable_fields = {'id', 'ext', 'format_id'}
+        format_re = re.compile(STR_FORMAT_RE_TMPL.format('[^)]*', f'[{STR_FORMAT_TYPES}ljhqBUDS]'))
+        outtmpl_parts = []
+        trimmable_markers = []
+        pos = 0
+        marker_id = 0
+        for mobj in format_re.finditer(outtmpl):
+            outtmpl_parts.append(outtmpl[pos:mobj.end()])
+            pos = mobj.end()
+            if pos >= len(outtmpl) or outtmpl[pos] != '+':
+                continue
+            field = mobj.group('key') or ''
+            if any(part in non_trimmable_fields for part in field.split(',')):
+                pos += 1
+                continue
+            start = f'{marker_prefix}_s{marker_id}_'
+            end = f'{marker_prefix}_e{marker_id}_'
+            trimmable_markers.append((start, end))
+            outtmpl_parts[-1] = f'{start}{outtmpl_parts[-1]}{end}'
+            pos += 1
+            marker_id += 1
+        outtmpl_parts.append(outtmpl[pos:])
+        return ''.join(outtmpl_parts), trimmable_markers
+
+    def _strip_trim_markers(self, filename, trimmable_markers):
+        for start, end in trimmable_markers:
+            filename = filename.replace(start, '').replace(end, '')
+        return filename
+
+    def _truncate_trimmable_fields(self, filename, trimmable_markers, overflow):
+        if overflow <= 0:
+            return filename
+        values = []
+        total_len = 0
+        for start, end in trimmable_markers:
+            mark_re = re.escape(start) + r'(.*?)' + re.escape(end)
+            mobj = re.search(mark_re, filename, flags=re.DOTALL)
+            values.append(mobj.group(1) if mobj else None)
+        
+        total_len += sum(len(v) for v in values if v is not None)
+        if not total_len:
+            return filename
+
+        remaining = min(overflow, total_len)
+        cuts = []
+        for v in values:
+            if v is None:
+                cuts.append(0)
+            else:
+                cuts.append(min(len(v), int(remaining * len(v) / total_len)))
+        remaining -= sum(cuts)
+        if remaining > 0:
+            for idx, value in enumerate(values):
+                if value is None:
+                    continue
+                capacity = len(value) - cuts[idx]
+                if capacity <= 0:
+                    continue
+                give = min(remaining, capacity)
+                cuts[idx] += give
+                remaining -= give
+                if remaining <= 0:
+                    break
+
+        for (start, end), value, cut in zip(trimmable_markers, values, cuts):
+            if value is None or cut <= 0:
+                continue
+            trimmed = value[:-cut] if cut < len(value) else ''
+            filename = filename.replace(f'{start}{value}{end}', f'{start}{trimmed}{end}', 1)
+        return filename
+
+    def _get_filesystem_path_limit(self, path):
+        if os.name == 'nt':
+            return 259
+        directory = os.path.dirname(path) or '.'
+        with contextlib.suppress(OSError, AttributeError, ValueError):
+            path_max = os.pathconf(directory, 'PC_PATH_MAX')
+            if path_max and path_max > 0:
+                return path_max - 1
+        return 4095
+    
     @_catch_unsafe_extension_error
     def _prepare_filename(self, info_dict, *, outtmpl=None, tmpl_type=None):
         assert None in (outtmpl, tmpl_type), 'outtmpl and tmpl_type are mutually exclusive'
@@ -1496,6 +1579,7 @@ class YoutubeDL:
             outtmpl = self.params['outtmpl'].get(tmpl_type or 'default', self.params['outtmpl']['default'])
         try:
             outtmpl = self._outtmpl_expandpath(outtmpl)
+            outtmpl, trimmable_markers = self._extract_trimmable_fields(outtmpl)
             filename = self.evaluate_outtmpl(outtmpl, info_dict, True)
             if not filename:
                 return None
@@ -1515,7 +1599,7 @@ class YoutubeDL:
                 no_ext, *ext = filename.rsplit('.', 2)
                 filename = join_nonempty(no_ext[:trim_file_name], *ext, delim='.')
 
-            return filename
+            return filename, trimmable_markers
         except ValueError as err:
             self.report_error('Error in output template: ' + str(err) + ' (encoding: ' + repr(preferredencoding()) + ')')
             return None
@@ -1525,7 +1609,11 @@ class YoutubeDL:
         if outtmpl:
             assert not dir_type, 'outtmpl and dir_type are mutually exclusive'
             dir_type = None
-        filename = self._prepare_filename(info_dict, tmpl_type=dir_type, outtmpl=outtmpl)
+        prepared = self._prepare_filename(info_dict, tmpl_type=dir_type, outtmpl=outtmpl)
+        if prepared is None:
+            filename, trimmable_markers = None, ()
+        else:
+            filename, trimmable_markers = prepared
         if not filename and dir_type not in ('', 'temp'):
             return ''
 
@@ -1539,7 +1627,14 @@ class YoutubeDL:
         if filename == '-' or not filename:
             return filename
 
-        return self.get_output_path(dir_type, filename)
+        full_filename = self.get_output_path(dir_type, filename)
+        if trimmable_markers and full_filename != '-':
+            clean_filename = self._strip_trim_markers(full_filename, trimmable_markers)
+            overflow = len(clean_filename) - self._get_filesystem_path_limit(full_filename)
+            if overflow > 0:
+                filename = self._truncate_trimmable_fields(filename, trimmable_markers, overflow)
+                full_filename = self.get_output_path(dir_type, filename)
+        return self._strip_trim_markers(full_filename, trimmable_markers)
 
     def _match_entry(self, info_dict, incomplete=False, silent=False):
         """Returns None if the file should be downloaded"""

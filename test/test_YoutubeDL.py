@@ -857,6 +857,38 @@ class TestYoutubeDL(unittest.TestCase):
         test('%(title3)s', ('foo/bar\\test', 'foo⧸bar⧹test'))
         test('folder/%(title3)s', ('folder/foo/bar\\test', f'folder{os.path.sep}foo⧸bar⧹test'))
 
+        # Adaptive trimming for trimmable (+) fields
+        trim_info = {
+            'id': 'ID1234',
+            'ext': 'mp4',
+            'title': 'T' * 120,
+            'alt_title': 'A' * 80,
+        }
+        with patch.object(YoutubeDL, '_get_filesystem_path_limit', return_value=64):
+            ydl = FakeYDL({
+                'outtmpl': '%(alt_title)s+-%(title)s+ [%(id)s].%(ext)s',
+                'paths': {'home': 'downloads/base/path'},
+            })
+            filename = ydl.prepare_filename(trim_info)
+            self.assertTrue(filename.endswith(' [ID1234].mp4'))
+            self.assertLessEqual(len(filename), 64)
+            self.assertNotIn('__yt_dlp_trim_', filename)
+
+        with patch.object(YoutubeDL, '_get_filesystem_path_limit', return_value=48):
+            ydl = FakeYDL({'outtmpl': '%(title)s [%(id)s].%(ext)s'})
+            filename = ydl.prepare_filename(trim_info)
+            self.assertGreater(len(filename), 48)
+
+        with patch.object(YoutubeDL, '_get_filesystem_path_limit', return_value=20):
+            ydl = FakeYDL({'outtmpl': '%(id)s+ [%(ext)s+].%(ext)s'})
+            filename = ydl.prepare_filename(trim_info)
+            self.assertEqual(filename, 'ID1234 [mp4].mp4')
+
+        with patch.object(YoutubeDL, '_get_filesystem_path_limit', return_value=14):
+            ydl = FakeYDL({'outtmpl': '%(format_id)s+-%(title)s+.%(ext)s'})
+            filename = ydl.prepare_filename({**trim_info, 'format_id': 'fmt1234567890'})
+            self.assertIn('fmt1234567890', filename)
+
     def test_format_note(self):
         ydl = YoutubeDL()
         self.assertEqual(ydl._format_note({}), '')
